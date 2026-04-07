@@ -325,6 +325,7 @@ class FieldNotesApp(tk.Tk):
         self.active_cat_id       = None
         self.active_note_type_id = None
         self.active_tag          = None
+        self._card_photos        = {}   # keeps PhotoImage refs alive for card view
 
         # Accordion open/closed state
         self.section_open = {
@@ -658,6 +659,7 @@ class FieldNotesApp(tk.Tk):
     # ── Refresh / render ──────────────────────────────────────────
 
     def _refresh(self):
+        self._card_photos = {}   # drop refs from previous render
         for w in self.notes_frame.winfo_children():
             w.destroy()
 
@@ -768,23 +770,35 @@ class FieldNotesApp(tk.Tk):
                 anchor="w", wraplength=700, justify="left"
             ).grid(row=1, column=0, sticky="ew", pady=(2, 4))
 
-        # Body (plain text preview)
-        display_text = note.get("content") or ""
-        if display_text:
+        # Body — render rich content (images + formatting) if available
+        has_content = bool(note.get("content_rich") or note.get("content"))
+        if has_content:
             body = tk.Text(
                 content_area, font=FONTS["body"],
                 bg=COLORS["note_bg"], fg=COLORS["text"],
                 relief="flat", bd=0, wrap="word",
                 cursor="arrow", state="normal", padx=0, pady=0,
             )
-            body.insert("1.0", display_text)
+            # Configure formatting tags
+            family, size = FONTS["body"][0], FONTS["body"][1]
+            body.tag_configure("bold",      font=(family, size, "bold"))
+            body.tag_configure("italic",    font=(family, size, "italic"))
+            body.tag_configure("underline", underline=True)
+            body.tag_configure("bullet",    lmargin1=20, lmargin2=30)
+
+            self._render_note_body(body, note)
             body.config(state="disabled")
 
-            lines = display_text.count("\n") + 1
-            estimated_lines = max(lines, len(display_text) // 80 + 1)
-            body.config(height=min(estimated_lines + 1, 30))
-            body.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+            # Height: use text estimate for plain notes, cap at 30 for rich/image notes
+            plain = note.get("content") or ""
+            if note.get("image_count", 0) > 0:
+                body.config(height=30)
+            else:
+                lines = plain.count("\n") + 1
+                estimated = max(lines, len(plain) // 80 + 1)
+                body.config(height=min(estimated + 1, 30))
 
+            body.grid(row=2, column=0, sticky="ew", pady=(0, 4))
             body.bind("<MouseWheel>", self._on_mousewheel)
             body.bind("<Button-4>",   self._on_mousewheel)
             body.bind("<Button-5>",   self._on_mousewheel)
@@ -825,6 +839,60 @@ class FieldNotesApp(tk.Tk):
         tk.Frame(self.notes_frame, height=1, bg=COLORS["separator"]).pack(fill="x", padx=24, pady=(10, 0))
 
     # ── Actions ───────────────────────────────────────────────────
+
+    def _render_note_body(self, text_widget, note):
+        """Render rich content (text, formatting, images) into a read-only card Text widget."""
+        content_rich = note.get("content_rich")
+        if not content_rich:
+            text_widget.insert("1.0", note.get("content") or "")
+            return
+        try:
+            data = json.loads(content_rich)
+            if data.get("v") != 2:
+                text_widget.insert("1.0", note.get("content") or "")
+                return
+
+            images     = get_note_images(note["id"]) if note.get("image_count", 0) > 0 else {}
+            char_count = 0
+            tag_starts = {}
+
+            for event in data.get("events", []):
+                k, v = event["k"], event["v"]
+                if k == "t":
+                    text_widget.insert("end", v)
+                    char_count += len(v)
+                elif k == "on" and v in RICH_TAGS:
+                    tag_starts[v] = char_count
+                elif k == "off" and v in RICH_TAGS:
+                    start = tag_starts.pop(v, None)
+                    if start is not None:
+                        text_widget.tag_add(v,
+                            f"1.0 + {start} chars",
+                            f"1.0 + {char_count} chars")
+                elif k == "img" and v in images:
+                    photo = self._make_card_photo(images[v])
+                    if photo:
+                        key = f"{note['id']}_{v}"
+                        self._card_photos[key] = photo
+                        text_widget.image_create("end", image=photo)
+                        text_widget.insert("end", "\n")
+                        char_count += 1
+        except Exception as exc:
+            print(f"[Field Notes] Card render error: {exc}")
+            text_widget.insert("1.0", note.get("content") or "")
+
+    def _make_card_photo(self, data):
+        """Convert image bytes to a thumbnail PhotoImage for card display."""
+        try:
+            if PIL_AVAILABLE:
+                img = Image.open(io.BytesIO(data))
+                img.thumbnail((500, 300), Image.LANCZOS)
+                return ImageTk.PhotoImage(img)
+            else:
+                return tk.PhotoImage(data=base64.b64encode(data).decode())
+        except Exception as exc:
+            print(f"[Field Notes] Card image error: {exc}")
+            return None
 
     def _do_pin(self, note):
         toggle_pin(note["id"], note["pinned"])
