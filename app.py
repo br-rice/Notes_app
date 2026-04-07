@@ -199,6 +199,18 @@ def delete_tag(tag_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM tags WHERE id=?", (tag_id,))
 
+def rename_category(cat_id, new_name):
+    with get_conn() as conn:
+        conn.execute("UPDATE categories SET name=? WHERE id=?", (new_name.strip(), cat_id))
+
+def rename_note_type(nt_id, new_name):
+    with get_conn() as conn:
+        conn.execute("UPDATE note_types SET name=? WHERE id=?", (new_name.strip(), nt_id))
+
+def rename_tag(tag_id, new_name):
+    with get_conn() as conn:
+        conn.execute("UPDATE tags SET name=? WHERE id=?", (new_name.strip().lower(), tag_id))
+
 def get_notes(search="", cat_type=None, category_id=None, note_type_ids=None,
               tags=None, sort="newest", pinned_first=True):
     sql = """
@@ -539,7 +551,7 @@ class FieldNotesApp(tk.Tk):
                      ).grid(row=0, column=0, sticky="w", pady=4)
             return
 
-        h = min(len(self._notetype_list), 6)
+        h = min(len(self._notetype_list) + 1, 7)
         lb = tk.Listbox(
             self.notetype_frame, selectmode=tk.EXTENDED, exportselection=False,
             font=FONTS["ui_sm"], bg=COLORS["bg"], fg=COLORS["muted"],
@@ -547,12 +559,16 @@ class FieldNotesApp(tk.Tk):
             selectforeground="#fff", activestyle="none", height=h,
             highlightbackground=COLORS["border"], highlightthickness=1,
         )
+        lb.insert(tk.END, "All types")
         for nt in self._notetype_list:
             lb.insert(tk.END, nt["name"])
 
-        for i, nt in enumerate(self._notetype_list):
-            if nt["id"] in self.active_note_type_ids:
-                lb.selection_set(i)
+        if not self.active_note_type_ids:
+            lb.selection_set(0)
+        else:
+            for i, nt in enumerate(self._notetype_list):
+                if nt["id"] in self.active_note_type_ids:
+                    lb.selection_set(i + 1)
 
         lb.grid(row=0, column=0, sticky="ew", pady=4)
         lb.bind("<<ListboxSelect>>", lambda e: self._on_notetype_select(lb))
@@ -563,9 +579,15 @@ class FieldNotesApp(tk.Tk):
                  ).grid(row=1, column=0, sticky="w")
 
     def _on_notetype_select(self, lb):
-        self.active_note_type_ids = {
-            self._notetype_list[i]["id"] for i in lb.curselection()
-        }
+        sel = set(lb.curselection())
+        if not sel or 0 in sel:
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(0)
+            self.active_note_type_ids = set()
+        else:
+            self.active_note_type_ids = {
+                self._notetype_list[i - 1]["id"] for i in sel if i > 0
+            }
         self._refresh()
 
     def _build_tag_listbox(self):
@@ -580,7 +602,7 @@ class FieldNotesApp(tk.Tk):
                      ).grid(row=0, column=0, sticky="w", pady=4)
             return
 
-        h = min(len(self._tag_list), 6)
+        h = min(len(self._tag_list) + 1, 7)
         lb = tk.Listbox(
             self.tag_frame, selectmode=tk.EXTENDED, exportselection=False,
             font=FONTS["ui_sm"], bg=COLORS["bg"], fg=COLORS["muted"],
@@ -588,12 +610,16 @@ class FieldNotesApp(tk.Tk):
             selectforeground="#fff", activestyle="none", height=h,
             highlightbackground=COLORS["border"], highlightthickness=1,
         )
+        lb.insert(tk.END, "All tags")
         for tag in self._tag_list:
             lb.insert(tk.END, f"#{tag}")
 
-        for i, tag in enumerate(self._tag_list):
-            if tag in self.active_tags:
-                lb.selection_set(i)
+        if not self.active_tags:
+            lb.selection_set(0)
+        else:
+            for i, tag in enumerate(self._tag_list):
+                if tag in self.active_tags:
+                    lb.selection_set(i + 1)
 
         lb.grid(row=0, column=0, sticky="ew", pady=4)
         lb.bind("<<ListboxSelect>>", lambda e: self._on_tag_select(lb))
@@ -604,7 +630,13 @@ class FieldNotesApp(tk.Tk):
                  ).grid(row=1, column=0, sticky="w")
 
     def _on_tag_select(self, lb):
-        self.active_tags = {self._tag_list[i] for i in lb.curselection()}
+        sel = set(lb.curselection())
+        if not sel or 0 in sel:
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(0)
+            self.active_tags = set()
+        else:
+            self.active_tags = {self._tag_list[i - 1] for i in sel if i > 0}
         self._refresh()
 
     def _build_sort_filters(self):
@@ -1508,12 +1540,17 @@ class ManageNotes(tk.Toplevel):
                      ).grid(row=0, column=1, sticky="w", pady=6)
             tk.Label(row, text=c["type"], font=FONTS["ui_sm"],
                      bg=COLORS["bg"], fg=COLORS["faint"], anchor="e"
-                     ).grid(row=0, column=2, sticky="e", padx=8)
+                     ).grid(row=0, column=2, sticky="e", padx=4)
+            tk.Button(row, text="✎", font=FONTS["ui_sm"],
+                      bg=COLORS["bg"], fg=COLORS["muted"], relief="flat",
+                      activebackground=COLORS["border"], cursor="hand2",
+                      command=lambda cid=c["id"], cn=c["name"]: self._rename_project(cid, cn)
+                      ).grid(row=0, column=3, padx=2)
             tk.Button(row, text="✕", font=FONTS["ui_sm"],
                       bg=COLORS["bg"], fg=COLORS["faint"], relief="flat",
                       activebackground=COLORS["border"], cursor="hand2",
                       command=lambda cid=c["id"]: self._delete_project(cid)
-                      ).grid(row=0, column=3, padx=6)
+                      ).grid(row=0, column=4, padx=6)
 
     def _pick_proj_color(self):
         from tkinter.colorchooser import askcolor
@@ -1538,6 +1575,15 @@ class ManageNotes(tk.Toplevel):
                                "Remove this project?\nNotes in it won't be deleted.",
                                icon="warning", parent=self):
             delete_category(cat_id)
+            self._populate_proj_list()
+            if self.on_change:
+                self.on_change()
+
+    def _rename_project(self, cat_id, current_name):
+        from tkinter.simpledialog import askstring
+        new_name = askstring("Rename project", "New name:", initialvalue=current_name, parent=self)
+        if new_name and new_name.strip() and new_name.strip() != current_name:
+            rename_category(cat_id, new_name)
             self._populate_proj_list()
             if self.on_change:
                 self.on_change()
@@ -1589,11 +1635,16 @@ class ManageNotes(tk.Toplevel):
             tk.Label(row, text=nt["name"], font=FONTS["ui"],
                      bg=COLORS["bg"], fg=COLORS["text"], anchor="w"
                      ).grid(row=0, column=0, sticky="w", padx=12, pady=6)
+            tk.Button(row, text="✎", font=FONTS["ui_sm"],
+                      bg=COLORS["bg"], fg=COLORS["muted"], relief="flat",
+                      activebackground=COLORS["border"], cursor="hand2",
+                      command=lambda nid=nt["id"], nn=nt["name"]: self._rename_type(nid, nn)
+                      ).grid(row=0, column=1, padx=2)
             tk.Button(row, text="✕", font=FONTS["ui_sm"],
                       bg=COLORS["bg"], fg=COLORS["faint"], relief="flat",
                       activebackground=COLORS["border"], cursor="hand2",
                       command=lambda nid=nt["id"]: self._delete_type(nid)
-                      ).grid(row=0, column=1, padx=6)
+                      ).grid(row=0, column=2, padx=6)
 
     def _add_type(self):
         name = self._type_name_var.get().strip()
@@ -1611,6 +1662,15 @@ class ManageNotes(tk.Toplevel):
                                "Remove this note type?\nNotes using it won't be deleted.",
                                icon="warning", parent=self):
             delete_note_type(nt_id)
+            self._populate_types_list()
+            if self.on_change:
+                self.on_change()
+
+    def _rename_type(self, nt_id, current_name):
+        from tkinter.simpledialog import askstring
+        new_name = askstring("Rename type", "New name:", initialvalue=current_name, parent=self)
+        if new_name and new_name.strip() and new_name.strip() != current_name:
+            rename_note_type(nt_id, new_name)
             self._populate_types_list()
             if self.on_change:
                 self.on_change()
@@ -1649,17 +1709,31 @@ class ManageNotes(tk.Toplevel):
             tk.Label(row, text=f"#{tag['name']}", font=FONTS["ui"],
                      bg=COLORS["bg"], fg=COLORS["text"], anchor="w"
                      ).grid(row=0, column=0, sticky="w", padx=12, pady=6)
+            tk.Button(row, text="✎", font=FONTS["ui_sm"],
+                      bg=COLORS["bg"], fg=COLORS["muted"], relief="flat",
+                      activebackground=COLORS["border"], cursor="hand2",
+                      command=lambda tid=tag["id"], tn=tag["name"]: self._rename_tag(tid, tn)
+                      ).grid(row=0, column=1, padx=2)
             tk.Button(row, text="✕", font=FONTS["ui_sm"],
                       bg=COLORS["bg"], fg=COLORS["faint"], relief="flat",
                       activebackground=COLORS["border"], cursor="hand2",
                       command=lambda tid=tag["id"]: self._delete_tag(tid)
-                      ).grid(row=0, column=1, padx=6)
+                      ).grid(row=0, column=2, padx=6)
 
     def _delete_tag(self, tag_id):
         if messagebox.askyesno("Remove tag",
                                "Remove this tag?\nNotes using it won't be deleted.",
                                icon="warning", parent=self):
             delete_tag(tag_id)
+            self._populate_tags_list()
+            if self.on_change:
+                self.on_change()
+
+    def _rename_tag(self, tag_id, current_name):
+        from tkinter.simpledialog import askstring
+        new_name = askstring("Rename tag", "New name:", initialvalue=current_name, parent=self)
+        if new_name and new_name.strip() and new_name.strip().lower() != current_name:
+            rename_tag(tag_id, new_name)
             self._populate_tags_list()
             if self.on_change:
                 self.on_change()
