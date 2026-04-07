@@ -2,14 +2,24 @@
 Field Notes — personal knowledge base
 Run with: python app.py
 No installs needed — uses only Python built-ins.
+Optional: pip install Pillow  (enables clipboard screenshots + JPEG/PNG images)
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, filedialog
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 import json
+import base64
+import uuid
+import io
+
+try:
+    from PIL import Image, ImageTk, ImageGrab
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -23,25 +33,28 @@ FONTS = {
     "ui":       ("Segoe UI", 10),
     "ui_sm":    ("Segoe UI", 9),
     "ui_bold":  ("Segoe UI", 10, "bold"),
+    "toolbar":  ("Segoe UI", 10, "bold"),
 }
 
 COLORS = {
-    "bg":           "#F5F2EC",
-    "surface":      "#FEFCF8",
-    "border":       "#DDD8CC",
-    "text":         "#1C1A16",
-    "muted":        "#7A7568",
-    "faint":        "#B0AA9E",
-    "accent":       "#2F5C3E",
-    "accent_light": "#E8F0EB",
-    "white":        "#FFFFFF",
-    "note_bg":      "#FEFCF8",
-    "pin_stripe":   "#2F5C3E",
-    "separator":    "#E8E4DC",
-    "hover":        "#F0EDE5",
-    "sidebar":      "#FEFCF8",
-    "filter_active":"#2F5C3E",
-    "filter_text_active": "#FFFFFF",
+    "bg":                "#F5F2EC",
+    "surface":           "#FEFCF8",
+    "border":            "#DDD8CC",
+    "text":              "#1C1A16",
+    "muted":             "#7A7568",
+    "faint":             "#B0AA9E",
+    "accent":            "#2F5C3E",
+    "accent_light":      "#E8F0EB",
+    "white":             "#FFFFFF",
+    "note_bg":           "#FEFCF8",
+    "pin_stripe":        "#2F5C3E",
+    "separator":         "#E8E4DC",
+    "hover":             "#F0EDE5",
+    "sidebar":           "#FEFCF8",
+    "filter_active":     "#2F5C3E",
+    "filter_text_active":"#FFFFFF",
+    "toolbar_bg":        "#F0EDE5",
+    "toolbar_active":    "#DDD8CC",
 }
 
 DEFAULT_CATS = [
@@ -70,13 +83,14 @@ def init_db():
                 type  TEXT NOT NULL DEFAULT 'other'
             );
             CREATE TABLE IF NOT EXISTS notes (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                title       TEXT,
-                content     TEXT,
-                category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
-                pinned      INTEGER NOT NULL DEFAULT 0,
-                created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-                updated_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                title        TEXT,
+                content      TEXT,
+                content_rich TEXT,
+                category_id  INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+                pinned       INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                updated_at   TEXT NOT NULL DEFAULT (datetime('now','localtime'))
             );
             CREATE TABLE IF NOT EXISTS tags (
                 id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +101,19 @@ def init_db():
                 tag_id  INTEGER REFERENCES tags(id)  ON DELETE CASCADE,
                 PRIMARY KEY (note_id, tag_id)
             );
+            CREATE TABLE IF NOT EXISTS note_images (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                img_key TEXT NOT NULL,
+                data    BLOB NOT NULL
+            );
         """)
+        # Non-destructive migration: add content_rich column to existing DBs
+        try:
+            conn.execute("ALTER TABLE notes ADD COLUMN content_rich TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         cur = conn.execute("SELECT COUNT(*) FROM categories")
         if cur.fetchone()[0] == 0:
             conn.executemany(
@@ -116,7 +142,8 @@ def get_notes(search="", cat_type=None, category_id=None, tag=None,
               sort="newest", pinned_first=True):
     sql = """
         SELECT n.*, c.name AS cat_name, c.color AS cat_color, c.type AS cat_type,
-               GROUP_CONCAT(DISTINCT t.name) AS tags
+               GROUP_CONCAT(DISTINCT t.name) AS tags,
+               (SELECT COUNT(*) FROM note_images WHERE note_id = n.id) AS image_count
         FROM notes n
         LEFT JOIN categories c ON n.category_id = c.id
         LEFT JOIN note_tags nt ON n.id = nt.note_id
@@ -153,20 +180,24 @@ def get_notes(search="", cat_type=None, category_id=None, tag=None,
     with get_conn() as conn:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
-def save_note(title, content, category_id, tags_str, note_id=None):
+def save_note(title, content_plain, content_rich, category_id, tags_str, note_id=None):
+    """
+    content_plain: plain text (used for search)
+    content_rich:  JSON with formatting events (used by editor)
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     tags = [t.strip().lower() for t in tags_str.split(",") if t.strip()]
     with get_conn() as conn:
         if note_id:
             conn.execute(
-                "UPDATE notes SET title=?,content=?,category_id=?,updated_at=? WHERE id=?",
-                (title or None, content, category_id or None, now, note_id)
+                "UPDATE notes SET title=?,content=?,content_rich=?,category_id=?,updated_at=? WHERE id=?",
+                (title or None, content_plain, content_rich, category_id or None, now, note_id)
             )
         else:
             cur = conn.execute(
-                "INSERT INTO notes (title,content,category_id,created_at,updated_at)"
-                " VALUES (?,?,?,?,?)",
-                (title or None, content, category_id or None, now, now)
+                "INSERT INTO notes (title,content,content_rich,category_id,created_at,updated_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (title or None, content_plain, content_rich, category_id or None, now, now)
             )
             note_id = cur.lastrowid
         conn.execute("DELETE FROM note_tags WHERE note_id=?", (note_id,))
@@ -175,6 +206,24 @@ def save_note(title, content, category_id, tags_str, note_id=None):
             tid = conn.execute("SELECT id FROM tags WHERE name=?", (tag,)).fetchone()[0]
             conn.execute("INSERT OR IGNORE INTO note_tags VALUES (?,?)", (note_id, tid))
     return note_id
+
+def save_note_images(note_id, images):
+    """Save images: dict of {img_key: bytes}."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM note_images WHERE note_id=?", (note_id,))
+        for key, data in images.items():
+            conn.execute(
+                "INSERT INTO note_images (note_id, img_key, data) VALUES (?,?,?)",
+                (note_id, key, sqlite3.Binary(data))
+            )
+
+def get_note_images(note_id):
+    """Returns dict of {img_key: bytes}."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT img_key, data FROM note_images WHERE note_id=?", (note_id,)
+        ).fetchall()
+        return {r[0]: bytes(r[1]) for r in rows}
 
 def delete_note(note_id):
     with get_conn() as conn:
@@ -189,9 +238,14 @@ def get_all_tags():
         return [r[0] for r in conn.execute("SELECT name FROM tags ORDER BY name")]
 
 def export_json():
+    notes = get_notes(sort="newest", pinned_first=False)
+    # Strip binary image data from export (images stay in DB only)
+    for n in notes:
+        if n.get("image_count", 0):
+            n["_note"] = f"{n['image_count']} embedded image(s) not exported"
     return json.dumps({
         "categories": get_categories(),
-        "notes": get_notes(sort="newest", pinned_first=False)
+        "notes": notes
     }, indent=2, default=str)
 
 def hex_tint(hex_color, factor=0.85):
@@ -208,7 +262,10 @@ def hex_tint(hex_color, factor=0.85):
 def fmt_dt(iso):
     try:
         dt = datetime.strptime(iso[:19], "%Y-%m-%d %H:%M:%S")
-        return dt.strftime("%-d %b %Y") if hasattr(dt, 'day') else dt.strftime("%d %b %Y").lstrip("0")
+        try:
+            return dt.strftime("%-d %b %Y")   # Linux/Mac
+        except ValueError:
+            return dt.strftime("%d %b %Y").lstrip("0")  # Windows fallback
     except Exception:
         return iso or ""
 
@@ -225,7 +282,7 @@ class FieldNotesApp(tk.Tk):
         # Filter state
         self.search_var    = tk.StringVar()
         self.sort_var      = tk.StringVar(value="newest")
-        self.active_type   = None   # "personal" | "professional" | "other" | None
+        self.active_type   = None
         self.active_cat_id = None
         self.active_tag    = None
 
@@ -240,7 +297,6 @@ class FieldNotesApp(tk.Tk):
     def _build_ui(self):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
-
         self._build_sidebar()
         self._build_main()
 
@@ -251,29 +307,24 @@ class FieldNotesApp(tk.Tk):
         sb.grid_propagate(False)
         sb.columnconfigure(0, weight=1)
 
-        # Title
         tk.Label(sb, text="Field Notes", font=("Georgia", 16, "bold italic"),
                  bg=COLORS["sidebar"], fg=COLORS["text"],
                  anchor="w", padx=16, pady=14).grid(row=0, column=0, sticky="ew")
 
-        sep = tk.Frame(sb, height=1, bg=COLORS["border"])
-        sep.grid(row=1, column=0, sticky="ew")
+        tk.Frame(sb, height=1, bg=COLORS["border"]).grid(row=1, column=0, sticky="ew")
 
-        # New note button
         tk.Button(sb, text="＋  New note",
                   font=FONTS["ui_bold"], bg=COLORS["accent"], fg="#fff",
                   activebackground="#234a30", activeforeground="#fff",
                   relief="flat", cursor="hand2", pady=8,
                   command=self._open_new_note
-                  ).grid(row=2, column=0, sticky="ew", padx=14, pady=(14,4))
+                  ).grid(row=2, column=0, sticky="ew", padx=14, pady=(14, 4))
 
-        sep2 = tk.Frame(sb, height=1, bg=COLORS["border"])
-        sep2.grid(row=3, column=0, sticky="ew", pady=(10,0))
+        tk.Frame(sb, height=1, bg=COLORS["border"]).grid(row=3, column=0, sticky="ew", pady=(10, 0))
 
-        # Search
         tk.Label(sb, text="SEARCH", font=("Courier New", 8, "bold"),
                  bg=COLORS["sidebar"], fg=COLORS["faint"],
-                 anchor="w", padx=16).grid(row=4, column=0, sticky="ew", pady=(10,2))
+                 anchor="w", padx=16).grid(row=4, column=0, sticky="ew", pady=(10, 2))
 
         search_frame = tk.Frame(sb, bg=COLORS["sidebar"])
         search_frame.grid(row=5, column=0, sticky="ew", padx=14)
@@ -284,56 +335,48 @@ class FieldNotesApp(tk.Tk):
                                      fg=COLORS["text"], relief="flat",
                                      highlightbackground=COLORS["border"],
                                      highlightthickness=1, insertbackground=COLORS["text"])
-        self.search_entry.grid(row=0, column=0, sticky="ew", ipady=5, padx=(0,0))
+        self.search_entry.grid(row=0, column=0, sticky="ew", ipady=5)
 
-        sep3 = tk.Frame(sb, height=1, bg=COLORS["border"])
-        sep3.grid(row=6, column=0, sticky="ew", pady=(12,0))
+        tk.Frame(sb, height=1, bg=COLORS["border"]).grid(row=6, column=0, sticky="ew", pady=(12, 0))
 
-        # --- LEVEL 1 FILTERS (type) ---
         tk.Label(sb, text="AREA", font=("Courier New", 8, "bold"),
                  bg=COLORS["sidebar"], fg=COLORS["faint"],
-                 anchor="w", padx=16).grid(row=7, column=0, sticky="ew", pady=(10,4))
+                 anchor="w", padx=16).grid(row=7, column=0, sticky="ew", pady=(10, 4))
 
         self.type_frame = tk.Frame(sb, bg=COLORS["sidebar"])
         self.type_frame.grid(row=8, column=0, sticky="ew", padx=10)
         self.type_frame.columnconfigure(0, weight=1)
         self._build_type_filters()
 
-        sep4 = tk.Frame(sb, height=1, bg=COLORS["border"])
-        sep4.grid(row=9, column=0, sticky="ew", pady=(12,0))
+        tk.Frame(sb, height=1, bg=COLORS["border"]).grid(row=9, column=0, sticky="ew", pady=(12, 0))
 
-        # --- LEVEL 2 FILTERS (specific categories) ---
         tk.Label(sb, text="CATEGORY", font=("Courier New", 8, "bold"),
                  bg=COLORS["sidebar"], fg=COLORS["faint"],
-                 anchor="w", padx=16).grid(row=10, column=0, sticky="ew", pady=(10,4))
+                 anchor="w", padx=16).grid(row=10, column=0, sticky="ew", pady=(10, 4))
 
         self.cat_frame = tk.Frame(sb, bg=COLORS["sidebar"])
         self.cat_frame.grid(row=11, column=0, sticky="ew", padx=10)
         self.cat_frame.columnconfigure(0, weight=1)
         self._build_cat_filters()
 
-        sep5 = tk.Frame(sb, height=1, bg=COLORS["border"])
-        sep5.grid(row=12, column=0, sticky="ew", pady=(12,0))
+        tk.Frame(sb, height=1, bg=COLORS["border"]).grid(row=12, column=0, sticky="ew", pady=(12, 0))
 
-        # --- TAGS ---
         tk.Label(sb, text="TAG", font=("Courier New", 8, "bold"),
                  bg=COLORS["sidebar"], fg=COLORS["faint"],
-                 anchor="w", padx=16).grid(row=13, column=0, sticky="ew", pady=(10,4))
+                 anchor="w", padx=16).grid(row=13, column=0, sticky="ew", pady=(10, 4))
 
         self.tag_frame = tk.Frame(sb, bg=COLORS["sidebar"])
         self.tag_frame.grid(row=14, column=0, sticky="ew", padx=10)
         self.tag_frame.columnconfigure(0, weight=1)
         self._build_tag_filters()
 
-        sep6 = tk.Frame(sb, height=1, bg=COLORS["border"])
-        sep6.grid(row=15, column=0, sticky="ew", pady=(12,0))
+        tk.Frame(sb, height=1, bg=COLORS["border"]).grid(row=15, column=0, sticky="ew", pady=(12, 0))
 
-        # Sort
         tk.Label(sb, text="SORT", font=("Courier New", 8, "bold"),
                  bg=COLORS["sidebar"], fg=COLORS["faint"],
-                 anchor="w", padx=16).grid(row=16, column=0, sticky="ew", pady=(10,2))
+                 anchor="w", padx=16).grid(row=16, column=0, sticky="ew", pady=(10, 2))
 
-        sort_opts = ["newest", "oldest", "updated", "alpha", "category"]
+        sort_opts   = ["newest", "oldest", "updated", "alpha", "category"]
         sort_labels = ["Newest first", "Oldest first", "Last updated", "Alphabetical", "By category"]
         self.sort_var.set("newest")
 
@@ -343,9 +386,8 @@ class FieldNotesApp(tk.Tk):
                                 fg=COLORS["muted"], selectcolor=COLORS["sidebar"],
                                 activebackground=COLORS["sidebar"],
                                 command=self._refresh, anchor="w", padx=14, cursor="hand2")
-            rb.grid(row=17+i, column=0, sticky="ew")
+            rb.grid(row=17 + i, column=0, sticky="ew")
 
-        # Bottom buttons
         btm = tk.Frame(sb, bg=COLORS["sidebar"])
         btm.grid(row=25, column=0, sticky="sew", padx=14, pady=14)
         btm.columnconfigure(0, weight=1)
@@ -355,7 +397,7 @@ class FieldNotesApp(tk.Tk):
                   bg=COLORS["bg"], fg=COLORS["muted"], relief="flat",
                   activebackground=COLORS["border"], cursor="hand2",
                   command=self._open_manage_cats
-                  ).grid(row=0, column=0, sticky="ew", pady=(0,4), ipady=4)
+                  ).grid(row=0, column=0, sticky="ew", pady=(0, 4), ipady=4)
 
         tk.Button(btm, text="Export JSON backup", font=FONTS["ui_sm"],
                   bg=COLORS["bg"], fg=COLORS["muted"], relief="flat",
@@ -390,7 +432,6 @@ class FieldNotesApp(tk.Tk):
         if self.active_type:
             cats = [c for c in cats if c["type"] == self.active_type]
 
-        # "All" option
         active_all = self.active_cat_id is None
         btn = tk.Button(
             self.cat_frame, text="All categories",
@@ -405,7 +446,6 @@ class FieldNotesApp(tk.Tk):
 
         for i, c in enumerate(cats):
             active = self.active_cat_id == c["id"]
-            dot = "● "
             btn = tk.Button(
                 self.cat_frame,
                 text=f"  {c['name']}",
@@ -416,7 +456,7 @@ class FieldNotesApp(tk.Tk):
                 relief="flat", anchor="w", padx=10, cursor="hand2",
                 command=lambda cid=c["id"]: self._set_cat(cid)
             )
-            btn.grid(row=i+1, column=0, sticky="ew", pady=1, ipady=3)
+            btn.grid(row=i + 1, column=0, sticky="ew", pady=1, ipady=3)
 
     def _build_tag_filters(self):
         for w in self.tag_frame.winfo_children():
@@ -447,7 +487,7 @@ class FieldNotesApp(tk.Tk):
                 relief="flat", anchor="w", padx=10, cursor="hand2",
                 command=lambda t=tag: self._set_tag(t)
             )
-            btn.grid(row=i+1, column=0, sticky="ew", pady=1, ipady=3)
+            btn.grid(row=i + 1, column=0, sticky="ew", pady=1, ipady=3)
 
     def _build_main(self):
         main = tk.Frame(self, bg=COLORS["bg"])
@@ -455,7 +495,6 @@ class FieldNotesApp(tk.Tk):
         main.columnconfigure(0, weight=1)
         main.rowconfigure(1, weight=1)
 
-        # Top bar
         topbar = tk.Frame(main, bg=COLORS["surface"],
                           highlightbackground=COLORS["border"], highlightthickness=1)
         topbar.grid(row=0, column=0, sticky="ew")
@@ -469,7 +508,6 @@ class FieldNotesApp(tk.Tk):
                                     bg=COLORS["surface"], fg=COLORS["faint"])
         self.count_label.grid(row=0, column=1, sticky="w", padx=4)
 
-        # Scrollable note area
         scroll_container = tk.Frame(main, bg=COLORS["bg"])
         scroll_container.grid(row=1, column=0, sticky="nsew")
         scroll_container.columnconfigure(0, weight=1)
@@ -545,7 +583,7 @@ class FieldNotesApp(tk.Tk):
         total = len(get_notes())
         self.count_label.config(
             text=f"{len(notes)} note{'s' if len(notes) != 1 else ''}"
-                 + (" filtered" if len(notes) < total else f" total")
+                 + (" filtered" if len(notes) < total else " total")
         )
 
         if not notes:
@@ -560,19 +598,16 @@ class FieldNotesApp(tk.Tk):
         for i, note in enumerate(notes):
             self._render_note(note, i)
 
-        # Scroll to top on refresh
         self.canvas.yview_moveto(0)
 
     def _render_note(self, note, index):
         """Render one note as a block in the continuous scroll."""
         is_pinned = bool(note["pinned"])
 
-        # Outer container
         outer = tk.Frame(self.notes_frame, bg=COLORS["bg"])
         outer.pack(fill="x", padx=24, pady=(0, 0))
         outer.columnconfigure(0, weight=1)
 
-        # Card frame
         card = tk.Frame(
             outer,
             bg=COLORS["note_bg"],
@@ -582,7 +617,6 @@ class FieldNotesApp(tk.Tk):
         card.pack(fill="x", pady=(10, 0))
         card.columnconfigure(0, weight=1)
 
-        # Pin stripe (left border effect via inner frame)
         if is_pinned:
             stripe = tk.Frame(card, bg=COLORS["pin_stripe"], width=4)
             stripe.pack(side="left", fill="y")
@@ -598,20 +632,29 @@ class FieldNotesApp(tk.Tk):
 
         if note.get("cat_name"):
             cat_color = note.get("cat_color") or COLORS["muted"]
-            cat_label = tk.Label(
+            tk.Label(
                 top_row,
                 text=f"  {note['cat_name']}  ",
                 font=("Courier New", 8, "bold"),
                 bg=hex_tint(cat_color),
                 fg=cat_color,
                 relief="flat", padx=2, pady=1
-            )
-            cat_label.grid(row=0, column=0, sticky="w")
+            ).grid(row=0, column=0, sticky="w")
 
         if is_pinned:
             tk.Label(top_row, text="📌", font=("Segoe UI", 9),
                      bg=COLORS["note_bg"], fg=COLORS["faint"]
                      ).grid(row=0, column=1, sticky="w", padx=6)
+
+        # Image badge
+        img_count = note.get("image_count", 0)
+        if img_count:
+            tk.Label(top_row,
+                     text=f"📷 {img_count} image{'s' if img_count > 1 else ''}",
+                     font=("Segoe UI", 8),
+                     bg=COLORS["note_bg"], fg=COLORS["faint"]
+                     ).grid(row=0, column=1, sticky="e" if not is_pinned else "w",
+                            padx=(20 if is_pinned else 0, 0))
 
         date_str = fmt_dt(note["created_at"])
         if note["updated_at"] != note["created_at"]:
@@ -629,8 +672,9 @@ class FieldNotesApp(tk.Tk):
                 anchor="w", wraplength=700, justify="left"
             ).grid(row=1, column=0, sticky="ew", pady=(2, 4))
 
-        # Body content
-        if note.get("content"):
+        # Body — always display plain text in card view
+        display_text = note.get("content") or ""
+        if display_text:
             body = tk.Text(
                 content_area,
                 font=FONTS["body"],
@@ -641,18 +685,16 @@ class FieldNotesApp(tk.Tk):
                 state="normal",
                 padx=0, pady=0,
             )
-            body.insert("1.0", note["content"])
+            body.insert("1.0", display_text)
             body.config(state="disabled")
 
-            # Auto-size height to content
-            lines = note["content"].count("\n") + 1
-            chars = len(note["content"])
+            lines = display_text.count("\n") + 1
+            chars = len(display_text)
             estimated_lines = max(lines, chars // 80 + 1)
             body.config(height=min(estimated_lines + 1, 30))
 
             body.grid(row=2, column=0, sticky="ew", pady=(0, 4))
 
-            # Bind scroll to canvas even when hovering text widget
             body.bind("<MouseWheel>", self._on_mousewheel)
             body.bind("<Button-4>",   self._on_mousewheel)
             body.bind("<Button-5>",   self._on_mousewheel)
@@ -685,23 +727,12 @@ class FieldNotesApp(tk.Tk):
                 command=cmd
             )
 
-        make_btn(btn_row, "Edit",
-                 lambda n=note: self._open_edit_note(n)
-                 ).pack(side="left", padx=2)
-
+        make_btn(btn_row, "Edit",   lambda n=note: self._open_edit_note(n)).pack(side="left", padx=2)
         pin_text = "Unpin" if is_pinned else "Pin"
-        make_btn(btn_row, pin_text,
-                 lambda n=note: self._do_pin(n)
-                 ).pack(side="left", padx=2)
+        make_btn(btn_row, pin_text, lambda n=note: self._do_pin(n)).pack(side="left", padx=2)
+        make_btn(btn_row, "Delete", lambda n=note: self._do_delete(n), danger=True).pack(side="left", padx=2)
 
-        make_btn(btn_row, "Delete",
-                 lambda n=note: self._do_delete(n),
-                 danger=True
-                 ).pack(side="left", padx=2)
-
-        # Separator line between notes
-        sep = tk.Frame(self.notes_frame, height=1, bg=COLORS["separator"])
-        sep.pack(fill="x", padx=24, pady=(10, 0))
+        tk.Frame(self.notes_frame, height=1, bg=COLORS["separator"]).pack(fill="x", padx=24, pady=(10, 0))
 
     # ── Actions ───────────────────────────────────────────────────
 
@@ -736,7 +767,6 @@ class FieldNotesApp(tk.Tk):
         self._refresh()
 
     def _export(self):
-        from tkinter import filedialog
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("JSON", "*.json")],
@@ -749,15 +779,19 @@ class FieldNotesApp(tk.Tk):
 
 # ── Note Editor Dialog ────────────────────────────────────────────────────────
 
+RICH_TAGS = ("bold", "italic", "underline", "bullet")
+
 class NoteEditor(tk.Toplevel):
     def __init__(self, parent, note=None, on_save=None):
         super().__init__(parent)
         self.note    = note
         self.on_save = on_save
         self.cats    = get_categories()
+        self._photos     = {}   # img_key -> PhotoImage (prevents GC)
+        self._image_data = {}   # img_key -> bytes (for saving)
 
         self.title("Edit note" if note else "New note")
-        self.geometry("680x580")
+        self.geometry("760x640")
         self.configure(bg=COLORS["surface"])
         self.resizable(True, True)
         self.grab_set()
@@ -770,14 +804,16 @@ class NoteEditor(tk.Toplevel):
         else:
             self.content_box.focus_set()
 
+    # ── Build ─────────────────────────────────────────────────────
+
     def _build(self):
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=1)
 
         # Title
         tk.Label(self, text="Title (optional)", font=FONTS["ui_sm"],
                  bg=COLORS["surface"], fg=COLORS["muted"],
-                 anchor="w").grid(row=0, column=0, sticky="ew", padx=20, pady=(16,2))
+                 anchor="w").grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 2))
 
         self.title_var = tk.StringVar()
         tk.Entry(self, textvariable=self.title_var,
@@ -787,16 +823,21 @@ class NoteEditor(tk.Toplevel):
                  insertbackground=COLORS["text"]
                  ).grid(row=1, column=0, sticky="ew", padx=20, ipady=6)
 
-        # Content
+        # Content label
         tk.Label(self, text="Content", font=FONTS["ui_sm"],
                  bg=COLORS["surface"], fg=COLORS["muted"],
-                 anchor="w").grid(row=2, column=0, sticky="nw", padx=20, pady=(10,2))
+                 anchor="w").grid(row=2, column=0, sticky="nw", padx=20, pady=(10, 2))
 
+        # Formatting toolbar
+        toolbar = self._build_toolbar()
+        toolbar.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 2))
+
+        # Content text area
         content_frame = tk.Frame(self, bg=COLORS["surface"])
-        content_frame.grid(row=3, column=0, sticky="nsew", padx=20)
+        content_frame.grid(row=4, column=0, sticky="nsew", padx=20)
         content_frame.columnconfigure(0, weight=1)
         content_frame.rowconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
+        self.rowconfigure(4, weight=1)
 
         self.content_box = tk.Text(
             content_frame,
@@ -805,7 +846,8 @@ class NoteEditor(tk.Toplevel):
             relief="flat",
             highlightbackground=COLORS["border"], highlightthickness=1,
             insertbackground=COLORS["text"],
-            wrap="word", padx=10, pady=8
+            wrap="word", padx=10, pady=8,
+            undo=True,
         )
         self.content_box.grid(row=0, column=0, sticky="nsew")
 
@@ -813,25 +855,33 @@ class NoteEditor(tk.Toplevel):
         cscroll.grid(row=0, column=1, sticky="ns")
         self.content_box.config(yscrollcommand=cscroll.set)
 
+        self._configure_tags()
+
+        # Keyboard shortcuts
+        self.content_box.bind("<Control-b>", lambda e: (self._toggle_format("bold"),   "break")[1])
+        self.content_box.bind("<Control-i>", lambda e: (self._toggle_format("italic"), "break")[1])
+        self.content_box.bind("<Control-u>", lambda e: (self._toggle_format("underline"), "break")[1])
+        self.content_box.bind("<Control-v>", self._on_paste)
+
         # Bottom row: category + tags + buttons
         bottom = tk.Frame(self, bg=COLORS["surface"])
-        bottom.grid(row=4, column=0, sticky="ew", padx=20, pady=14)
+        bottom.grid(row=5, column=0, sticky="ew", padx=20, pady=14)
         bottom.columnconfigure(1, weight=1)
 
         tk.Label(bottom, text="Category:", font=FONTS["ui_sm"],
                  bg=COLORS["surface"], fg=COLORS["muted"]
-                 ).grid(row=0, column=0, sticky="w", pady=(0,4))
+                 ).grid(row=0, column=0, sticky="w", pady=(0, 4))
 
         self.cat_var = tk.StringVar(value="— none —")
         cat_names = ["— none —"] + [c["name"] for c in self.cats]
-        cat_dd = ttk.Combobox(bottom, textvariable=self.cat_var,
-                              values=cat_names, state="readonly",
-                              font=FONTS["ui_sm"], width=22)
-        cat_dd.grid(row=0, column=1, sticky="w", padx=(6,0), pady=(0,4))
+        ttk.Combobox(bottom, textvariable=self.cat_var,
+                     values=cat_names, state="readonly",
+                     font=FONTS["ui_sm"], width=22
+                     ).grid(row=0, column=1, sticky="w", padx=(6, 0), pady=(0, 4))
 
         tk.Label(bottom, text="Tags:", font=FONTS["ui_sm"],
                  bg=COLORS["surface"], fg=COLORS["muted"]
-                 ).grid(row=1, column=0, sticky="w", pady=(0,10))
+                 ).grid(row=1, column=0, sticky="w", pady=(0, 10))
 
         self.tags_var = tk.StringVar()
         tk.Entry(bottom, textvariable=self.tags_var,
@@ -839,20 +889,20 @@ class NoteEditor(tk.Toplevel):
                  bg=COLORS["bg"], fg=COLORS["text"], relief="flat",
                  highlightbackground=COLORS["border"], highlightthickness=1,
                  insertbackground=COLORS["text"]
-                 ).grid(row=1, column=1, sticky="ew", padx=(6,0), ipady=4, pady=(0,10))
+                 ).grid(row=1, column=1, sticky="ew", padx=(6, 0), ipady=4, pady=(0, 10))
 
         tk.Label(bottom, text="comma-separated, e.g. theory-of-change, land-tenure",
                  font=("Courier New", 8), bg=COLORS["surface"], fg=COLORS["faint"]
-                 ).grid(row=2, column=1, sticky="w", padx=(6,0))
+                 ).grid(row=2, column=1, sticky="w", padx=(6, 0))
 
         btn_frame = tk.Frame(bottom, bg=COLORS["surface"])
-        btn_frame.grid(row=3, column=0, columnspan=2, sticky="e", pady=(12,0))
+        btn_frame.grid(row=3, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
         tk.Button(btn_frame, text="Cancel", font=FONTS["ui"],
                   bg=COLORS["bg"], fg=COLORS["muted"], relief="flat",
                   activebackground=COLORS["border"], cursor="hand2",
                   padx=14, pady=6, command=self.destroy
-                  ).pack(side="left", padx=(0,8))
+                  ).pack(side="left", padx=(0, 8))
 
         tk.Button(btn_frame, text="Save note", font=FONTS["ui_bold"],
                   bg=COLORS["accent"], fg="#fff", relief="flat",
@@ -860,15 +910,252 @@ class NoteEditor(tk.Toplevel):
                   padx=14, pady=6, command=self._save
                   ).pack(side="left")
 
-        # Keyboard shortcut
         self.bind("<Control-Return>", lambda e: self._save())
+
+    def _build_toolbar(self):
+        """Build the formatting toolbar above the content area."""
+        bar = tk.Frame(self, bg=COLORS["toolbar_bg"],
+                       highlightbackground=COLORS["border"], highlightthickness=1)
+
+        def tbtn(text, cmd, tooltip_text=""):
+            b = tk.Button(bar, text=text, font=FONTS["toolbar"],
+                          bg=COLORS["toolbar_bg"], fg=COLORS["text"],
+                          relief="flat", cursor="hand2",
+                          padx=10, pady=3,
+                          activebackground=COLORS["toolbar_active"],
+                          command=cmd)
+            b.pack(side="left", padx=1, pady=2)
+            return b
+
+        def sep():
+            tk.Frame(bar, width=1, bg=COLORS["border"]).pack(
+                side="left", fill="y", padx=5, pady=4)
+
+        tbtn("B",  lambda: self._toggle_format("bold"))
+        tbtn("I",  lambda: self._toggle_format("italic"))
+        tbtn("U",  lambda: self._toggle_format("underline"))
+        sep()
+        tbtn("•  Bullet", self._insert_bullet)
+        sep()
+        tbtn("🖼  Image", self._insert_image_from_file)
+        tbtn("📋  Paste image", self._paste_image)
+
+        if not PIL_AVAILABLE:
+            tk.Label(bar,
+                     text="  tip: pip install Pillow for clipboard + JPEG support",
+                     font=("Segoe UI", 8), bg=COLORS["toolbar_bg"], fg=COLORS["faint"]
+                     ).pack(side="right", padx=8)
+
+        return bar
+
+    def _configure_tags(self):
+        """Configure visual appearance of rich-text tags."""
+        base_font = FONTS["body"]
+        family, size = base_font[0], base_font[1]
+        self.content_box.tag_configure("bold",      font=(family, size, "bold"))
+        self.content_box.tag_configure("italic",    font=(family, size, "italic"))
+        self.content_box.tag_configure("underline", underline=True)
+        self.content_box.tag_configure("bullet",    lmargin1=20, lmargin2=30)
+
+    # ── Formatting actions ────────────────────────────────────────
+
+    def _toggle_format(self, tag):
+        """Toggle a formatting tag on the current selection."""
+        try:
+            sel_start = self.content_box.index("sel.first")
+            sel_end   = self.content_box.index("sel.last")
+        except tk.TclError:
+            return  # No selection — nothing to do
+
+        # Check if the entire selection is already fully covered by this tag
+        ranges = self.content_box.tag_ranges(tag)
+        covered = False
+        for i in range(0, len(ranges), 2):
+            if (self.content_box.compare(ranges[i],     "<=", sel_start) and
+                    self.content_box.compare(ranges[i + 1], ">=", sel_end)):
+                covered = True
+                break
+
+        if covered:
+            self.content_box.tag_remove(tag, sel_start, sel_end)
+        else:
+            self.content_box.tag_add(tag, sel_start, sel_end)
+
+    def _insert_bullet(self):
+        """Toggle a bullet point at the start of the current line."""
+        insert_pos = self.content_box.index(tk.INSERT)
+        line_start = self.content_box.index(f"{insert_pos} linestart")
+        line_text  = self.content_box.get(line_start, f"{insert_pos} lineend")
+
+        if line_text.startswith("• "):
+            self.content_box.delete(line_start, f"{line_start}+2c")
+            line_end = self.content_box.index(f"{line_start} lineend")
+            self.content_box.tag_remove("bullet", line_start, f"{line_end}+1c")
+        else:
+            self.content_box.insert(line_start, "• ")
+            line_end = self.content_box.index(f"{line_start} lineend")
+            self.content_box.tag_add("bullet", line_start, f"{line_end}+1c")
+
+    # ── Image handling ────────────────────────────────────────────
+
+    def _bytes_to_photo(self, data):
+        """Convert raw image bytes to a tkinter PhotoImage, resizing if needed."""
+        try:
+            if PIL_AVAILABLE:
+                img = Image.open(io.BytesIO(data))
+                img.thumbnail((640, 480), Image.LANCZOS)
+                return ImageTk.PhotoImage(img)
+            else:
+                # Native tkinter: supports PNG and GIF only
+                b64 = base64.b64encode(data).decode()
+                return tk.PhotoImage(data=b64)
+        except Exception as exc:
+            print(f"[Field Notes] Image load error: {exc}")
+            return None
+
+    def _insert_image_bytes(self, data):
+        """Insert image bytes into the content box at the current cursor."""
+        photo = self._bytes_to_photo(data)
+        if not photo:
+            messagebox.showerror(
+                "Image error",
+                "Could not load this image.\n"
+                "Install Pillow for JPEG/BMP/WebP support:\n  pip install Pillow"
+            )
+            return
+        img_key = f"img_{uuid.uuid4().hex[:12]}"
+        self._photos[img_key]     = photo
+        self._image_data[img_key] = data
+        self.content_box.image_create(tk.INSERT, image=photo, name=img_key)
+        self.content_box.insert(tk.INSERT, "\n")   # newline after image
+
+    def _insert_image_from_file(self):
+        """Open a file dialog and insert the chosen image."""
+        if PIL_AVAILABLE:
+            ftypes = [("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.tiff"), ("All files", "*.*")]
+        else:
+            ftypes = [("Images (PNG/GIF)", "*.png *.gif"), ("All files", "*.*")]
+
+        path = filedialog.askopenfilename(filetypes=ftypes, title="Insert image")
+        if not path:
+            return
+        with open(path, "rb") as f:
+            self._insert_image_bytes(f.read())
+
+    def _paste_image(self, event=None):
+        """Paste an image from the clipboard (requires Pillow)."""
+        if not PIL_AVAILABLE:
+            messagebox.showinfo(
+                "Pillow required",
+                "To paste images from the clipboard, install Pillow:\n  pip install Pillow"
+            )
+            return "break"
+        try:
+            img = ImageGrab.grabclipboard()
+            if img is not None and hasattr(img, "size"):
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                self._insert_image_bytes(buf.getvalue())
+                return "break"   # Stop default text paste
+        except Exception as exc:
+            print(f"[Field Notes] Clipboard paste error: {exc}")
+        return None  # Fall through to normal text paste
+
+    def _on_paste(self, event):
+        """Ctrl+V handler: try image paste first, fall back to text paste."""
+        result = self._paste_image(event)
+        if result == "break":
+            return "break"
+        # Default text paste behaviour
+        return None
+
+    # ── Serialisation ─────────────────────────────────────────────
+
+    def _get_rich_content(self):
+        """
+        Serialise the Text widget content.
+        Returns (plain_text: str, rich_json: str).
+        plain_text is stored in notes.content for full-text search.
+        rich_json is stored in notes.content_rich for editor round-trips.
+        """
+        events = []
+        for key, value, index in self.content_box.dump("1.0", "end-1c", all=True):
+            if key == "text":
+                events.append({"k": "t", "v": value})
+            elif key == "tagon"  and value in RICH_TAGS:
+                events.append({"k": "on", "v": value})
+            elif key == "tagoff" and value in RICH_TAGS:
+                events.append({"k": "off", "v": value})
+            elif key == "image":
+                events.append({"k": "img", "v": value})   # value = img_key name
+
+        plain = "".join(e["v"] for e in events if e["k"] == "t").strip()
+        rich  = json.dumps({"v": 2, "events": events})
+        return plain, rich
+
+    def _load_rich_content(self, content_rich, note_id=None):
+        """
+        Deserialise content_rich JSON into the Text widget.
+        Returns True on success, False if fallback to plain text is needed.
+        """
+        try:
+            data = json.loads(content_rich)
+            if data.get("v") != 2:
+                return False
+
+            images      = get_note_images(note_id) if note_id else {}
+            char_count  = 0
+            tag_starts  = {}    # tag_name -> char offset when opened
+
+            for event in data.get("events", []):
+                k, v = event["k"], event["v"]
+
+                if k == "t":
+                    self.content_box.insert("end", v)
+                    char_count += len(v)
+
+                elif k == "on":
+                    tag_starts[v] = char_count
+
+                elif k == "off":
+                    start = tag_starts.pop(v, None)
+                    if start is not None:
+                        self.content_box.tag_add(
+                            v,
+                            f"1.0 + {start} chars",
+                            f"1.0 + {char_count} chars"
+                        )
+
+                elif k == "img":
+                    img_key = v
+                    if img_key in images:
+                        photo = self._bytes_to_photo(images[img_key])
+                        if photo:
+                            self._photos[img_key]     = photo
+                            self._image_data[img_key] = images[img_key]
+                            self.content_box.image_create("end", image=photo, name=img_key)
+                            char_count += 1   # embedded image = 1 char in tkinter index
+
+            return True
+        except Exception as exc:
+            print(f"[Field Notes] Rich content load error: {exc}")
+            return False
+
+    # ── Load / Save ───────────────────────────────────────────────
 
     def _load(self, note):
         self.title_var.set(note.get("title") or "")
-        self.content_box.insert("1.0", note.get("content") or "")
+
+        # Try rich content first, fall back to plain
+        loaded = False
+        if note.get("content_rich"):
+            loaded = self._load_rich_content(note["content_rich"], note.get("id"))
+        if not loaded:
+            self.content_box.insert("1.0", note.get("content") or "")
+
         if note.get("cat_name"):
             self.cat_var.set(note["cat_name"])
-        # Load tags
+
         with get_conn() as conn:
             rows = conn.execute("""
                 SELECT t.name FROM tags t
@@ -878,21 +1165,21 @@ class NoteEditor(tk.Toplevel):
             self.tags_var.set(", ".join(r[0] for r in rows))
 
     def _save(self):
-        title   = self.title_var.get().strip()
-        content = self.content_box.get("1.0", "end-1c").strip()
-        if not title and not content:
+        title = self.title_var.get().strip()
+        plain, rich = self._get_rich_content()
+
+        if not title and not plain and not self._image_data:
             messagebox.showwarning("Empty note", "Add a title or some content first.")
             return
 
         cat_name = self.cat_var.get()
-        cat_id = None
-        for c in self.cats:
-            if c["name"] == cat_name:
-                cat_id = c["id"]
-                break
+        cat_id   = next((c["id"] for c in self.cats if c["name"] == cat_name), None)
 
-        save_note(title, content, cat_id, self.tags_var.get(),
-                  note_id=self.note["id"] if self.note else None)
+        note_id = save_note(
+            title, plain, rich, cat_id, self.tags_var.get(),
+            note_id=self.note["id"] if self.note else None
+        )
+        save_note_images(note_id, self._image_data)
 
         if self.on_save:
             self.on_save()
@@ -921,24 +1208,21 @@ class ManageCats(tk.Toplevel):
                  bg=COLORS["surface"], fg=COLORS["text"],
                  anchor="w", padx=20, pady=12).grid(row=0, column=0, sticky="ew")
 
-        # Scrollable list
         list_frame = tk.Frame(self, bg=COLORS["surface"])
         list_frame.grid(row=1, column=0, sticky="nsew", padx=20)
         list_frame.columnconfigure(0, weight=1)
         self.list_inner = list_frame
         self._populate_list()
 
-        sep = tk.Frame(self, height=1, bg=COLORS["border"])
-        sep.grid(row=2, column=0, sticky="ew", pady=(10,0))
+        tk.Frame(self, height=1, bg=COLORS["border"]).grid(row=2, column=0, sticky="ew", pady=(10, 0))
 
-        # Add new category
         add_frame = tk.Frame(self, bg=COLORS["surface"])
         add_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=14)
         add_frame.columnconfigure(1, weight=1)
 
         tk.Label(add_frame, text="Add category", font=FONTS["ui_bold"],
                  bg=COLORS["surface"], fg=COLORS["text"]
-                 ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0,8))
+                 ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
         tk.Label(add_frame, text="Name", font=FONTS["ui_sm"],
                  bg=COLORS["surface"], fg=COLORS["muted"]
@@ -947,28 +1231,28 @@ class ManageCats(tk.Toplevel):
         tk.Entry(add_frame, textvariable=self.new_name, font=FONTS["ui"],
                  bg=COLORS["bg"], relief="flat",
                  highlightbackground=COLORS["border"], highlightthickness=1
-                 ).grid(row=1, column=1, sticky="ew", padx=(8,0), ipady=4)
+                 ).grid(row=1, column=1, sticky="ew", padx=(8, 0), ipady=4)
 
         tk.Label(add_frame, text="Type", font=FONTS["ui_sm"],
                  bg=COLORS["surface"], fg=COLORS["muted"]
-                 ).grid(row=2, column=0, sticky="w", pady=(6,0))
+                 ).grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.new_type = tk.StringVar(value="other")
         ttk.Combobox(add_frame, textvariable=self.new_type,
                      values=["personal", "professional", "other"],
                      state="readonly", font=FONTS["ui_sm"], width=16
-                     ).grid(row=2, column=1, sticky="w", padx=(8,0), pady=(6,0))
+                     ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
 
         tk.Label(add_frame, text="Color", font=FONTS["ui_sm"],
                  bg=COLORS["surface"], fg=COLORS["muted"]
-                 ).grid(row=3, column=0, sticky="w", pady=(6,0))
+                 ).grid(row=3, column=0, sticky="w", pady=(6, 0))
         self.new_color = tk.StringVar(value="#2f5c3e")
         color_row = tk.Frame(add_frame, bg=COLORS["surface"])
-        color_row.grid(row=3, column=1, sticky="w", padx=(8,0), pady=(6,0))
+        color_row.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
         self.color_preview = tk.Label(color_row, bg="#2f5c3e", width=3,
                                       relief="flat",
                                       highlightbackground=COLORS["border"],
                                       highlightthickness=1)
-        self.color_preview.pack(side="left", padx=(0,6), ipady=8)
+        self.color_preview.pack(side="left", padx=(0, 6), ipady=8)
         tk.Button(color_row, text="Pick color", font=FONTS["ui_sm"],
                   bg=COLORS["bg"], fg=COLORS["muted"], relief="flat",
                   activebackground=COLORS["border"], cursor="hand2",
@@ -979,23 +1263,22 @@ class ManageCats(tk.Toplevel):
                   bg=COLORS["accent"], fg="#fff", relief="flat",
                   activebackground="#234a30", cursor="hand2",
                   padx=12, pady=6, command=self._add
-                  ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12,0))
+                  ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
     def _populate_list(self):
         for w in self.list_inner.winfo_children():
             w.destroy()
 
-        cats = get_categories()
-        for i, c in enumerate(cats):
+        for c in get_categories():
             row = tk.Frame(self.list_inner, bg=COLORS["bg"],
                            highlightbackground=COLORS["border"],
                            highlightthickness=1)
             row.pack(fill="x", pady=2)
             row.columnconfigure(1, weight=1)
 
-            dot = tk.Label(row, bg=c["color"], width=2,
-                           highlightbackground=c["color"], highlightthickness=1)
-            dot.grid(row=0, column=0, sticky="ns", padx=(8,6), ipady=10)
+            tk.Label(row, bg=c["color"], width=2,
+                     highlightbackground=c["color"], highlightthickness=1
+                     ).grid(row=0, column=0, sticky="ns", padx=(8, 6), ipady=10)
 
             tk.Label(row, text=c["name"], font=FONTS["ui"],
                      bg=COLORS["bg"], fg=COLORS["text"], anchor="w"
