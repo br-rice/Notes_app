@@ -904,7 +904,6 @@ class NoteEditor(tk.Toplevel):
 
     def _build(self):
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
 
         # Title
         tk.Label(self, text="Title (optional)", font=FONTS["ui_sm"],
