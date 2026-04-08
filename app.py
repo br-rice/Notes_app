@@ -1294,9 +1294,15 @@ class NoteEditor(tk.Toplevel):
         return None
 
     def _on_paste(self, event):
-        # Only intercept Ctrl+V if PIL is available and the clipboard contains an image.
-        # Otherwise fall through so the Text widget's default text-paste runs.
+        # Only intercept Ctrl+V for images. If the clipboard has text (e.g. copied
+        # from OneNote which puts both text and an image on the clipboard), prefer
+        # text so the Text widget's default paste runs.
         if PIL_AVAILABLE:
+            try:
+                self.content_box.clipboard_get()
+                return None  # text is present — let default paste handle it
+            except tk.TclError:
+                pass  # no text; check for an image below
             try:
                 img = ImageGrab.grabclipboard()
                 if img is not None and hasattr(img, "size"):
