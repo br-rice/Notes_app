@@ -1294,8 +1294,19 @@ class NoteEditor(tk.Toplevel):
         return None
 
     def _on_paste(self, event):
-        result = self._paste_image(event)
-        return "break" if result == "break" else None
+        # Only intercept Ctrl+V if PIL is available and the clipboard contains an image.
+        # Otherwise fall through so the Text widget's default text-paste runs.
+        if PIL_AVAILABLE:
+            try:
+                img = ImageGrab.grabclipboard()
+                if img is not None and hasattr(img, "size"):
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG")
+                    self._insert_image_bytes(buf.getvalue())
+                    return "break"
+            except Exception as exc:
+                print(f"[Field Notes] Clipboard paste error: {exc}")
+        return None
 
     def _get_rich_content(self):
         events = []
