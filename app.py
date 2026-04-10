@@ -5,6 +5,7 @@ No installs needed — uses only Python built-ins.
 Optional: pip install Pillow  (enables clipboard screenshots + JPEG/PNG images)
 """
 
+import re
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sqlite3
@@ -847,6 +848,11 @@ class FieldNotesApp(tk.Tk):
             body.tag_configure("italic",    font=(family, size, "italic"))
             body.tag_configure("underline", underline=True)
             body.tag_configure("bullet",    lmargin1=20, lmargin2=30)
+            for _lv in range(1, 4):
+                _lm1, _lm2 = BULLET_INDENT[_lv]
+                body.tag_configure(f"bullet{_lv}", lmargin1=_lm1, lmargin2=_lm2)
+                _nm1, _nm2 = NUM_INDENT[_lv]
+                body.tag_configure(f"num{_lv}", lmargin1=_nm1, lmargin2=_nm2)
 
             self._render_note_body(body, note)
             body.config(state="disabled")
@@ -988,7 +994,15 @@ class FieldNotesApp(tk.Tk):
 
 # ── Note Editor Dialog ────────────────────────────────────────────────────────
 
-RICH_TAGS = ("bold", "italic", "underline", "bullet")
+RICH_TAGS = ("bold", "italic", "underline", "bullet",
+             "bullet1", "bullet2", "bullet3",
+             "num1",    "num2",    "num3")
+
+BULLET_CHARS  = {1: "• ", 2: "◦ ", 3: "▪ "}
+BULLET_INDENT = {1: (20, 30), 2: (44, 54), 3: (68, 78)}   # (lmargin1, lmargin2)
+NUM_INDENT    = {1: (20, 38), 2: (44, 62), 3: (68, 86)}
+
+_ALL_LIST_TAGS = ("bullet", "bullet1", "bullet2", "bullet3", "num1", "num2", "num3")
 
 class NoteEditor(tk.Toplevel):
     def __init__(self, parent, note=None, on_save=None):
@@ -1059,6 +1073,10 @@ class NoteEditor(tk.Toplevel):
         self.content_box.bind("<Control-i>", lambda e: (self._toggle_format("italic"),    "break")[1])
         self.content_box.bind("<Control-u>", lambda e: (self._toggle_format("underline"), "break")[1])
         self.content_box.bind("<Control-v>", self._on_paste)
+        self.content_box.bind("<Return>",    self._on_return)
+        self.content_box.bind("<Tab>",       self._on_tab)
+        self.content_box.bind("<Shift-Tab>", self._on_shift_tab)
+        self.content_box.bind("<BackSpace>", self._on_backspace)
 
         # ── Bottom metadata ──
         bottom = tk.Frame(self, bg=COLORS["surface"])
@@ -1189,7 +1207,10 @@ class NoteEditor(tk.Toplevel):
         tbtn("I",  lambda: self._toggle_format("italic")).pack(side="left", padx=1, pady=2)
         tbtn("U",  lambda: self._toggle_format("underline")).pack(side="left", padx=1, pady=2)
         sep()
-        tbtn("•  Bullet", self._insert_bullet).pack(side="left", padx=1, pady=2)
+        tbtn("•  List",  lambda: self._toggle_bullet(1)).pack(side="left", padx=1, pady=2)
+        tbtn("1.  List", lambda: self._toggle_num(1)).pack(side="left", padx=1, pady=2)
+        tbtn("→",        self._indent_list).pack(side="left", padx=1, pady=2)
+        tbtn("←",        self._outdent_list).pack(side="left", padx=1, pady=2)
         sep()
         tbtn("🖼  Image",       self._insert_image_from_file).pack(side="left", padx=1, pady=2)
         tbtn("📋  Paste image", self._paste_image).pack(side="left", padx=1, pady=2)
@@ -1206,7 +1227,12 @@ class NoteEditor(tk.Toplevel):
         self.content_box.tag_configure("bold",      font=(family, size, "bold"))
         self.content_box.tag_configure("italic",    font=(family, size, "italic"))
         self.content_box.tag_configure("underline", underline=True)
-        self.content_box.tag_configure("bullet",    lmargin1=20, lmargin2=30)
+        self.content_box.tag_configure("bullet",    lmargin1=20, lmargin2=30)  # legacy
+        for lv in range(1, 4):
+            lm1, lm2 = BULLET_INDENT[lv]
+            self.content_box.tag_configure(f"bullet{lv}", lmargin1=lm1, lmargin2=lm2)
+            nm1, nm2 = NUM_INDENT[lv]
+            self.content_box.tag_configure(f"num{lv}", lmargin1=nm1, lmargin2=nm2)
 
     def _toggle_format(self, tag):
         try:
@@ -1226,19 +1252,185 @@ class NoteEditor(tk.Toplevel):
         else:
             self.content_box.tag_add(tag, sel_start, sel_end)
 
-    def _insert_bullet(self):
-        insert_pos = self.content_box.index(tk.INSERT)
-        line_start = self.content_box.index(f"{insert_pos} linestart")
-        line_text  = self.content_box.get(line_start, f"{insert_pos} lineend")
+    # ── List helpers ──────────────────────────────────────────────────────────
 
-        if line_text.startswith("• "):
-            self.content_box.delete(line_start, f"{line_start}+2c")
-            line_end = self.content_box.index(f"{line_start} lineend")
-            self.content_box.tag_remove("bullet", line_start, f"{line_end}+1c")
+    def _get_line_list_tag(self, pos=None):
+        """Return the list tag for the line at pos, or None."""
+        if pos is None:
+            pos = self.content_box.index(tk.INSERT)
+        line_start = self.content_box.index(f"{pos} linestart")
+        for tag in self.content_box.tag_names(line_start):
+            if tag in _ALL_LIST_TAGS:
+                return tag
+        return None
+
+    def _get_line_prefix(self, line_start):
+        """Return the bullet/number text prefix at line_start, or ''."""
+        line_text = self.content_box.get(line_start, f"{line_start} lineend")
+        for chars in BULLET_CHARS.values():
+            if line_text.startswith(chars):
+                return chars
+        m = re.match(r'^\d+\. ', line_text)
+        return m.group() if m else ""
+
+    def _set_line_list_tag(self, tag, line_start):
+        """Remove all list tags from the line at line_start, then apply tag (if any)."""
+        line_end = self.content_box.index(f"{line_start} lineend")
+        span_end = f"{line_end}+1c"
+        for t in _ALL_LIST_TAGS:
+            self.content_box.tag_remove(t, line_start, span_end)
+        if tag:
+            self.content_box.tag_add(tag, line_start, span_end)
+
+    def _count_num_above(self, tag, line_start):
+        """Count contiguous numbered lines with `tag` immediately above line_start."""
+        line_num = int(line_start.split(".")[0])
+        count = 0
+        for ln in range(line_num - 1, 0, -1):
+            ls = f"{ln}.0"
+            if tag in self.content_box.tag_names(ls):
+                count += 1
+            else:
+                break
+        return count
+
+    def _toggle_bullet(self, level=1):
+        tag = f"bullet{level}"
+        pos        = self.content_box.index(tk.INSERT)
+        line_start = self.content_box.index(f"{pos} linestart")
+        current    = self._get_line_list_tag(pos)
+        prefix     = self._get_line_prefix(line_start)
+
+        if current == tag:
+            # Remove list
+            if prefix:
+                self.content_box.delete(line_start, f"{line_start}+{len(prefix)}c")
+            self._set_line_list_tag(None, line_start)
         else:
-            self.content_box.insert(line_start, "• ")
-            line_end = self.content_box.index(f"{line_start} lineend")
-            self.content_box.tag_add("bullet", line_start, f"{line_end}+1c")
+            # Replace prefix and apply tag
+            if prefix:
+                self.content_box.delete(line_start, f"{line_start}+{len(prefix)}c")
+            self.content_box.insert(line_start, BULLET_CHARS[level])
+            self._set_line_list_tag(tag, line_start)
+
+    def _toggle_num(self, level=1):
+        tag = f"num{level}"
+        pos        = self.content_box.index(tk.INSERT)
+        line_start = self.content_box.index(f"{pos} linestart")
+        current    = self._get_line_list_tag(pos)
+        prefix     = self._get_line_prefix(line_start)
+
+        if current == tag:
+            if prefix:
+                self.content_box.delete(line_start, f"{line_start}+{len(prefix)}c")
+            self._set_line_list_tag(None, line_start)
+        else:
+            if prefix:
+                self.content_box.delete(line_start, f"{line_start}+{len(prefix)}c")
+            num = self._count_num_above(tag, line_start) + 1
+            self.content_box.insert(line_start, f"{num}. ")
+            self._set_line_list_tag(tag, line_start)
+
+    def _change_list_level(self, new_tag, line_start):
+        """Switch the list level of a line to new_tag, updating the prefix."""
+        prefix = self._get_line_prefix(line_start)
+        if prefix:
+            self.content_box.delete(line_start, f"{line_start}+{len(prefix)}c")
+        if new_tag.startswith("bullet"):
+            lv = int(new_tag[-1])
+            self.content_box.insert(line_start, BULLET_CHARS[lv])
+        else:
+            lv  = int(new_tag[-1])
+            num = self._count_num_above(new_tag, line_start) + 1
+            self.content_box.insert(line_start, f"{num}. ")
+        self._set_line_list_tag(new_tag, line_start)
+
+    def _indent_list(self):
+        pos        = self.content_box.index(tk.INSERT)
+        line_start = self.content_box.index(f"{pos} linestart")
+        tag        = self._get_line_list_tag(pos)
+        if not tag:
+            return
+        kind  = "bullet" if tag.startswith("bullet") else "num"
+        level = int(tag[-1]) if tag[-1].isdigit() else 1
+        if level < 3:
+            self._change_list_level(f"{kind}{level + 1}", line_start)
+
+    def _outdent_list(self):
+        pos        = self.content_box.index(tk.INSERT)
+        line_start = self.content_box.index(f"{pos} linestart")
+        tag        = self._get_line_list_tag(pos)
+        if not tag:
+            return
+        kind  = "bullet" if tag.startswith("bullet") else "num"
+        level = int(tag[-1]) if tag[-1].isdigit() else 1
+        if level > 1:
+            self._change_list_level(f"{kind}{level - 1}", line_start)
+        else:
+            # Exit list entirely
+            prefix = self._get_line_prefix(line_start)
+            if prefix:
+                self.content_box.delete(line_start, f"{line_start}+{len(prefix)}c")
+            self._set_line_list_tag(None, line_start)
+
+    def _on_return(self, event):
+        pos        = self.content_box.index(tk.INSERT)
+        line_start = self.content_box.index(f"{pos} linestart")
+        tag        = self._get_line_list_tag(pos)
+        if not tag:
+            return  # Default Enter behaviour
+
+        prefix    = self._get_line_prefix(line_start)
+        line_text = self.content_box.get(line_start, f"{line_start} lineend")
+
+        # Empty list item → exit list
+        if line_text == prefix or line_text.strip() == prefix.strip():
+            if prefix:
+                self.content_box.delete(line_start, f"{line_start}+{len(prefix)}c")
+            self._set_line_list_tag(None, line_start)
+            return "break"
+
+        # Insert newline, then continue the list
+        self.content_box.insert(pos, "\n")
+        new_start = self.content_box.index(tk.INSERT)
+
+        if tag.startswith("bullet"):
+            lv = int(tag[-1]) if tag[-1].isdigit() else 1
+            self.content_box.insert(new_start, BULLET_CHARS[lv])
+        else:
+            lv  = int(tag[-1])
+            num = self._count_num_above(tag, new_start) + 1
+            self.content_box.insert(new_start, f"{num}. ")
+
+        new_line_end = self.content_box.index(f"{new_start} lineend")
+        self.content_box.tag_add(tag, new_start, f"{new_line_end}+1c")
+        return "break"
+
+    def _on_tab(self, event):
+        pos = self.content_box.index(tk.INSERT)
+        if self._get_line_list_tag(pos):
+            self._indent_list()
+            return "break"
+
+    def _on_shift_tab(self, event):
+        pos = self.content_box.index(tk.INSERT)
+        if self._get_line_list_tag(pos):
+            self._outdent_list()
+            return "break"
+
+    def _on_backspace(self, event):
+        pos        = self.content_box.index(tk.INSERT)
+        line_start = self.content_box.index(f"{pos} linestart")
+        tag        = self._get_line_list_tag(pos)
+        if not tag:
+            return
+        prefix = self._get_line_prefix(line_start)
+        if prefix:
+            prefix_end = f"{line_start}+{len(prefix)}c"
+            if self.content_box.compare(pos, "==", prefix_end):
+                self.content_box.delete(line_start, prefix_end)
+                self._set_line_list_tag(None, line_start)
+                return "break"
 
     def _bytes_to_photo(self, data):
         try:
