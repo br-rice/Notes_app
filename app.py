@@ -8,6 +8,7 @@ Optional: pip install Pillow  (enables clipboard screenshots + JPEG/PNG images)
 import re
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from tkinter import font as tkfont
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,12 @@ try:
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
+
+try:
+    from spellchecker import SpellChecker as _SpellChecker
+    SPELL_AVAILABLE = True
+except ImportError:
+    SPELL_AVAILABLE = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -367,7 +374,7 @@ class FieldNotesApp(tk.Tk):
         self.configure(bg=COLORS["bg"])
 
         self.search_var           = tk.StringVar()
-        self.sort_var             = tk.StringVar(value="newest")
+        self.sort_var             = tk.StringVar(value="updated")
         self.active_type          = None
         self.active_cat_id        = None
         self.active_note_type_ids = set()   # multi-select
@@ -379,8 +386,15 @@ class FieldNotesApp(tk.Tk):
             "project": False,
             "type":    False,
             "tags":    False,
-            "sort":    False,
+            "sort":    True,
         }
+
+        # Measure list indent widths once using actual font metrics
+        _mf = tkfont.Font(family=FONTS["body"][0], size=FONTS["body"][1])
+        _bw = _mf.measure("• ")
+        _nw = _mf.measure("00. ")
+        self._bullet_margins = {lv: (BULLET_INDENT[lv][0], BULLET_INDENT[lv][0] + _bw) for lv in range(1, 4)}
+        self._num_margins    = {lv: (NUM_INDENT[lv][0],    NUM_INDENT[lv][0]    + _nw) for lv in range(1, 4)}
 
         self._build_ui()
         self._refresh()
@@ -847,12 +861,12 @@ class FieldNotesApp(tk.Tk):
             body.tag_configure("bold",      font=(family, size, "bold"))
             body.tag_configure("italic",    font=(family, size, "italic"))
             body.tag_configure("underline", underline=True)
-            body.tag_configure("bullet",    lmargin1=20, lmargin2=30)
+            body.tag_configure("bullet", lmargin1=20, lmargin2=self._bullet_margins[1][1])
             for _lv in range(1, 4):
-                _lm1, _lm2 = BULLET_INDENT[_lv]
+                _lm1, _lm2 = self._bullet_margins[_lv]
                 body.tag_configure(f"bullet{_lv}", lmargin1=_lm1, lmargin2=_lm2)
-                _nm1, _nm2 = NUM_INDENT[_lv]
-                body.tag_configure(f"num{_lv}", lmargin1=_nm1, lmargin2=_nm2)
+                _lm1, _lm2 = self._num_margins[_lv]
+                body.tag_configure(f"num{_lv}", lmargin1=_lm1, lmargin2=_lm2)
 
             self._render_note_body(body, note)
             body.config(state="disabled")
@@ -1013,6 +1027,8 @@ class NoteEditor(tk.Toplevel):
         self.note_types = get_note_types()   # alphabetical
         self._photos     = {}
         self._image_data = {}
+        self._spell      = _SpellChecker() if SPELL_AVAILABLE else None
+        self._spell_after = None
 
         self.title("Edit note" if note else "New note")
         self.geometry("760x760")
@@ -1077,6 +1093,9 @@ class NoteEditor(tk.Toplevel):
         self.content_box.bind("<Tab>",       self._on_tab)
         self.content_box.bind("<Shift-Tab>", self._on_shift_tab)
         self.content_box.bind("<BackSpace>", self._on_backspace)
+        if self._spell:
+            self.content_box.bind("<KeyRelease>",  self._schedule_spellcheck)
+            self.content_box.bind("<Button-3>",    self._spell_context_menu)
 
         # ── Bottom metadata ──
         bottom = tk.Frame(self, bg=COLORS["surface"])
@@ -1227,12 +1246,18 @@ class NoteEditor(tk.Toplevel):
         self.content_box.tag_configure("bold",      font=(family, size, "bold"))
         self.content_box.tag_configure("italic",    font=(family, size, "italic"))
         self.content_box.tag_configure("underline", underline=True)
-        self.content_box.tag_configure("bullet",    lmargin1=20, lmargin2=30)  # legacy
+        # Measure actual prefix widths for accurate hanging-indent alignment
+        _f  = tkfont.Font(family=family, size=size)
+        _bw = _f.measure("• ")
+        _nw = _f.measure("00. ")
+        self.content_box.tag_configure("bullet", lmargin1=20, lmargin2=20 + _bw)  # legacy
         for lv in range(1, 4):
-            lm1, lm2 = BULLET_INDENT[lv]
-            self.content_box.tag_configure(f"bullet{lv}", lmargin1=lm1, lmargin2=lm2)
-            nm1, nm2 = NUM_INDENT[lv]
-            self.content_box.tag_configure(f"num{lv}", lmargin1=nm1, lmargin2=nm2)
+            lm1 = BULLET_INDENT[lv][0]
+            self.content_box.tag_configure(f"bullet{lv}", lmargin1=lm1, lmargin2=lm1 + _bw)
+            nm1 = NUM_INDENT[lv][0]
+            self.content_box.tag_configure(f"num{lv}", lmargin1=nm1, lmargin2=nm1 + _nw)
+        if self._spell:
+            self.content_box.tag_configure("misspelled", foreground="#cc2200", underline=True)
 
     def _toggle_format(self, tag):
         try:
@@ -1432,6 +1457,65 @@ class NoteEditor(tk.Toplevel):
                 self._set_line_list_tag(None, line_start)
                 return "break"
 
+    # ── Spell check ───────────────────────────────────────────────────────────
+
+    def _schedule_spellcheck(self, event=None):
+        if self._spell_after:
+            self.after_cancel(self._spell_after)
+        self._spell_after = self.after(600, self._run_spellcheck)
+
+    def _run_spellcheck(self):
+        self._spell_after = None
+        box = self.content_box
+        box.tag_remove("misspelled", "1.0", "end")
+        text = box.get("1.0", "end-1c")
+        for match in re.finditer(r"[a-zA-Z']+", text):
+            word = match.group().strip("'")
+            if not word or word[0].isupper():
+                continue
+            if self._spell.unknown([word]):
+                box.tag_add("misspelled",
+                            f"1.0 + {match.start()} chars",
+                            f"1.0 + {match.end()} chars")
+
+    def _spell_context_menu(self, event):
+        box = self.content_box
+        try:
+            idx = box.index(f"@{event.x},{event.y}")
+            if "misspelled" not in box.tag_names(idx):
+                return
+            w_start = box.index(f"{idx} wordstart")
+            w_end   = box.index(f"{idx} wordend")
+            word    = box.get(w_start, w_end).strip()
+            if not word:
+                return
+            candidates = self._spell.candidates(word) or set()
+            candidates.discard(word)
+            menu = tk.Menu(self, tearoff=0)
+            if candidates:
+                for s in sorted(candidates)[:6]:
+                    menu.add_command(
+                        label=s,
+                        command=lambda s=s, ws=w_start, we=w_end: self._apply_suggestion(s, ws, we)
+                    )
+                menu.add_separator()
+            menu.add_command(label="Add to dictionary",
+                             command=lambda w=word, ws=w_start, we=w_end: self._add_to_dict(w, ws, we))
+            menu.tk_popup(event.x_root, event.y_root)
+        except tk.TclError:
+            pass
+
+    def _apply_suggestion(self, suggestion, w_start, w_end):
+        self.content_box.delete(w_start, w_end)
+        self.content_box.insert(w_start, suggestion)
+        self._schedule_spellcheck()
+
+    def _add_to_dict(self, word, w_start, w_end):
+        self._spell.word_frequency.load_words([word])
+        self.content_box.tag_remove("misspelled", w_start, w_end)
+
+    # ── Image helpers ──────────────────────────────────────────────────────────
+
     def _bytes_to_photo(self, data):
         try:
             if PIL_AVAILABLE:
@@ -1590,6 +1674,9 @@ class NoteEditor(tk.Toplevel):
             for i, tag in enumerate(self._all_tags):
                 if tag in note_tags:
                     self._tags_lb.selection_set(i)
+
+        if self._spell:
+            self._schedule_spellcheck()
 
     def _save(self):
         title = self.title_var.get().strip()
